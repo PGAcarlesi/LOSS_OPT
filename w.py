@@ -38,7 +38,7 @@ class W(Module, ABC):
 
 class IMQ(W):
     def __init__(self, C=1) -> None:
-        self.C = Parameter(C, transform=positive(),dtype=tf.float64)
+        self.C = Parameter(C, transform=positive(),dtype=tf.float64,trainable=False)
 
     def W(self, X: TensorType, y: TensorType) -> tf.Tensor:
         return tf.math.sqrt(1/(1+(y/self.C)**2))
