@@ -5,7 +5,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import matplotlib.pyplot as plt
 import numpy as np
-
+from scipy.stats import ks_2samp
 
 
 class GVI_GP_alpha(gpflow.models.BayesianModel):
@@ -260,7 +260,13 @@ class GVI_GP_alpha(gpflow.models.BayesianModel):
         N = self.X.shape[0]
         f = np.random.multivariate_normal(mean=tf.squeeze(self.mu_f), cov=self.Sigma_f, size=n_samples)  # put the
         if self.loss_type == "MSE":
-            return f
+            err = self.Y - self.mu_f
+            # bootstrap on each column of err
+            N, D = err.shape
+            boot_err = np.zeros((n_samples, D))
+            for d in range(D):
+                boot_err[:, d] = np.random.choice(err[:, d], size=n_samples, replace=True)
+            return f + boot_err
         #add noise if we have a likelihood/generative model
         else:
             noise = tf.random.normal(
@@ -323,7 +329,7 @@ class GVI_GP_alpha(gpflow.models.BayesianModel):
         f_var = self.kernel(X,X) - K_xold_xnew @ K_inv @ tf.transpose(K_xold_xnew)+ K_xold_xnew @ K_inv @ self.Sigma_f @ K_inv @ tf.transpose(K_xold_xnew)
         return K_xold_xnew @ K_inv @ self.mu_f, tf.linalg.diag_part(f_var)
 
-    def compute_lambda_stat(self, n_samples=100):
+    def compute_lambda_stat(self, n_samples=100,):
         # sample_y returns (n_samples, N)
         y_sampl = self.sample_y(n_samples)  # (n_samples, N)
 
@@ -333,13 +339,141 @@ class GVI_GP_alpha(gpflow.models.BayesianModel):
         if self.loss_type != "MSE":
             variance += self.sigma ** 2
 
-        # per-sample mean squared error (one scalar per sampled function)
+
         s = tf.reduce_mean((y_sampl - tf.reshape(mu, [1, -1])) ** 2 / variance, axis=1)  # (n_samples,)
         # scalar mean squared residual on training data
         y_vec = tf.reshape(self.y, [-1])  # (N,)
         s_mean = tf.reduce_mean((y_vec - mu) ** 2 / variance)  # scalar
 
+
+
         return tf.reduce_mean(tf.cast(s < s_mean, tf.float32))
+
+
+    def compute_lambda_stat_new(self, n_samples=100,):
+        # sample_y returns (n_samples, N)
+        y_sampl = self.sample_y(n_samples)  # (n_samples, N)
+        s = [.0]*n_samples
+        K, Sigma_f = self.compute_sigma_f(self.X)
+        jitter = 1e-6 * tf.eye(tf.shape(Sigma_f)[0], dtype=Sigma_f.dtype)
+        eye = tf.eye(tf.shape(Sigma_f)[0], dtype=Sigma_f.dtype)
+
+        for i in range(n_samples):
+            # get mean and variance
+            Sigma_a = self.alpha * K + (1.0 - self.alpha) * Sigma_f
+            Sigma_a_inv = tf.linalg.inv(Sigma_a + jitter)
+
+            y_i = tf.transpose(y_sampl[i,:])
+
+            if self.loss_type == "MSE":
+                q1 = tf.linalg.inv(self.alpha * Sigma_a_inv + eye * self.lambda_i)
+                q2 = tf.matmul(eye * self.lambda_i, y_i)
+            else:
+                q1 = tf.linalg.inv(self.alpha * Sigma_a_inv + eye / self.sigma ** 2 * self.lambda_i)
+                q2 = tf.matmul(eye / self.sigma ** 2 * self.lambda_i, y_i)
+            mu_f = tf.matmul(q1, q2)
+
+
+            variance = tf.linalg.diag_part(Sigma_f)
+
+            if self.loss_type != "MSE":
+                variance += self.sigma ** 2
+
+            s[i] = tf.reduce_mean((y_i - tf.reshape(mu_f, [1, -1])) ** 2 / variance, axis=1)  # (n_samples,)
+
+        #calculate s_mean
+        variance = tf.linalg.diag_part(self.Sigma_f)
+
+        if self.loss_type != "MSE":
+            variance += self.sigma ** 2
+        s_mean = tf.reduce_mean((self.y - self.mu_f) ** 2 / variance)  # scalar
+
+        return tf.reduce_mean(tf.cast(s < s_mean, tf.float32))
+
+
+
+    """
+    TO CHECK CAREFULLY AND DISCUSS
+    """
+    def compute_lambda_stat_KS(self, n_samples=100):
+        """
+        Perform a goodness-of-fit KS test comparing the empirical distribution
+        of y_i to the Gaussian predictive distribution N(mu_f, variance)
+        for each simulated sample. Then compare these KS statistics to the one
+        computed for the observed data (y vs its predictive Gaussian).
+
+        Returns:
+            Monte Carlo p-value = proportion of simulated KS >= observed KS.
+        """
+
+        # sample_y returns (n_samples, N)
+        y_sampl = self.sample_y(n_samples)  # (n_samples, N)
+        ks_list = []
+
+        K, Sigma_f = self.compute_sigma_f(self.X)
+        jitter = 1e-6 * tf.eye(tf.shape(Sigma_f)[0], dtype=Sigma_f.dtype)
+        eye = tf.eye(tf.shape(Sigma_f)[0], dtype=Sigma_f.dtype)
+
+        def normal_cdf(x):
+            return 0.5 * (1.0 + tf.math.erf(x / tf.sqrt(tf.constant(2.0, dtype=x.dtype))))
+
+        def ks_one_sample(x, mu, sigma):
+            """
+            Compute one-sample KS statistic comparing data x to N(mu, sigma^2).
+            """
+            x = tf.reshape(x, [-1])
+            mu = tf.reshape(mu, [-1])
+            sigma = tf.reshape(sigma, [-1])
+
+            # Standardize data by their individual means and variances
+            z = (x - mu) / (sigma + 1e-12)
+            z_sorted = tf.sort(z)
+            n = tf.cast(tf.size(z_sorted), dtype=z_sorted.dtype)
+            i = tf.cast(tf.range(1, tf.size(z_sorted) + 1), dtype=z_sorted.dtype)
+            F0 = normal_cdf(z_sorted)
+            D_plus = tf.reduce_max(i / n - F0)
+            D_minus = tf.reduce_max(F0 - (i - 1) / n)
+            return tf.maximum(D_plus, D_minus)
+
+        # Loop over simulated datasets
+        for i in range(n_samples):
+            Sigma_a = self.alpha * K + (1.0 - self.alpha) * Sigma_f
+            Sigma_a_inv = tf.linalg.inv(Sigma_a + jitter)
+
+            y_i = tf.reshape(y_sampl[i, :], [-1, 1])
+
+            if self.loss_type == "MSE":
+                q1 = tf.linalg.inv(self.alpha * Sigma_a_inv + eye * self.lambda_i)
+                q2 = tf.matmul(eye * self.lambda_i, y_i)
+            else:
+                q1 = tf.linalg.inv(self.alpha * Sigma_a_inv + eye / (self.sigma ** 2) * self.lambda_i)
+                q2 = tf.matmul(eye / (self.sigma ** 2) * self.lambda_i, y_i)
+
+            mu_f = tf.reshape(tf.matmul(q1, q2), [-1])
+            variance = tf.linalg.diag_part(Sigma_f)
+            if self.loss_type != "MSE":
+                variance += self.sigma ** 2
+            sigma_f = tf.sqrt(variance + 1e-12)
+
+            # KS statistic comparing y_i to N(mu_f, sigma_f^2)
+            ks_val = ks_one_sample(y_i, mu_f, sigma_f)
+            ks_list.append(ks_val)
+
+        # Compute observed KS statistic
+        mu_obs = tf.reshape(self.mu_f, [-1])
+        variance_obs = tf.linalg.diag_part(self.Sigma_f)
+        if self.loss_type != "MSE":
+            variance_obs += self.sigma ** 2
+        sigma_obs = tf.sqrt(variance_obs + 1e-12)
+
+        y_obs = tf.reshape(self.y, [-1])
+        ks_obs = ks_one_sample(y_obs, mu_obs, sigma_obs)
+
+        # Monte Carlo p-value: proportion of simulated KS >= observed KS
+        ks_stack = tf.stack(ks_list)
+        p_mc = tf.reduce_mean(tf.cast(ks_stack >= ks_obs, tf.float32))
+
+        return p_mc
 
     #algorithm to choose the best lambda
     def pp_alg(self,lambda_values = [1., 0.1, 0.5, 0.7, 0.8, 0.9, 1.1, 1.2, 1.5, 2., 10.]):
@@ -359,12 +493,12 @@ class GVI_GP_alpha(gpflow.models.BayesianModel):
 
 #Sparse GP class
 class GVI_SGPR_alpha(gpflow.models.BayesianModel):
-    def __init__(self, X, y, inducing, N_u, objective="GVI",loss_type="MSE", structure="Tri", alpha=0.5, test_size=0.1):
+    def __init__(self, X, y, inducing,kernel, objective="GVI",loss_type="MSE", structure="Tri", alpha=0.5, test_size=0.1):
         super().__init__()
         self.X = X  # [N, D]
         self.y = y  # [N, 1]
         self.inducing_variable = inducing
-        self.N_u = N_u
+        self.N_u = self.inducing_variable.shape[0]
 
         self.objective = objective
         # Variational and GP parameters
@@ -378,8 +512,7 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
 
         self.test_size = test_size
         self.structure = structure
-        self.variance = gpflow.Parameter(1.0, transform=gpflow.utilities.positive())
-        self.lengthscale = gpflow.Parameter(1.0, transform=gpflow.utilities.positive())
+        self.kernel = kernel
         if loss_type != "MSE":
             self.sigma = gpflow.Parameter(1.0, transform=gpflow.utilities.positive())
         self.lambda_i = 1.
@@ -388,14 +521,12 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
     #Generalized variational objective to maximize
     def GVI_step(self):
         # Build kernel matrices
-        kernel = tfp.math.psd_kernels.ExponentiatedQuadratic(self.variance, self.lengthscale)
-        K_uu = kernel.matrix(self.inducing_variable, self.inducing_variable)
-        K_uf = kernel.matrix(self.inducing_variable, self.X)
+        K_uu = self.kernel(self.inducing_variable, self.inducing_variable)
+        K_uf =  self.kernel(self.inducing_variable, self.X)
         K_fu = tf.transpose(K_uf)
 
         # Constants
         N = tf.cast(tf.shape(self.X)[0], tf.float64)
-        I_M = tf.eye(self.N_u, dtype=tf.float64)
 
         # Invert via stable_solve
         jitter = tf.eye(self.N_u, dtype=tf.float64) * 1e-6
@@ -435,14 +566,18 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
         T1 = K_uu_inv @ (K_uf @ K_fu)
         T2 = T1 @ (K_uu_inv @ Sigma_u)
 
+        #compute kernel trace efficiently:
+        sum_diag = 0
+        for i in range(self.X.shape[0]):
+            sum_diag = tf.reduce_sum(self.kernel(self.X[i,], self.X[i,]))
         #compute expected loss term
         if self.loss_type == "MSE":
             term1 = 0.5 * tf.reduce_sum(tf.square(residual)) * self.lambda_i + 0.5 * self.lambda_i * (
-                        tf.reduce_sum(kernel.apply(self.X, self.X)) - tf.linalg.trace(T1) + tf.linalg.trace(T2))
+                        sum_diag - tf.linalg.trace(T1) + tf.linalg.trace(T2))
         else:
             term1 = 0.5 * tf.reduce_sum(tf.square(residual)) * (
                         self.sigma ** -2) * self.lambda_i + 0.5 * self.lambda_i * (
-                                tf.reduce_sum(kernel.apply(self.X, self.X)) - tf.linalg.trace(T1) + tf.linalg.trace(
+                                sum_diag - tf.linalg.trace(T1) + tf.linalg.trace(
                             T2)) * self.lambda_i + N * tf.math.log(self.sigma)
         #compute divergence term
         term2 = 0.5 * self.alpha * tf.reduce_sum(mu_u * (Sigma_a_inv @ mu_u))
@@ -469,9 +604,8 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
         X_train, X_test, y_train, y_test = train_test_split(self.X, self.y, test_size=self.test_size)
 
         #compute kernels
-        kernel = tfp.math.psd_kernels.ExponentiatedQuadratic(self.variance, self.lengthscale)
-        K_uu = kernel.matrix(self.inducing_variable, self.inducing_variable)
-        K_uf = kernel.matrix(self.inducing_variable, X_train)
+        K_uu = self.kernel(self.inducing_variable, self.inducing_variable)
+        K_uf = self.kernel(self.inducing_variable, X_train)
         K_fu = tf.transpose(K_uf)
 
         #utilities
@@ -503,8 +637,8 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
         mu_u = tf.matmul(q1, q2)
 
         #predictive mean
-        K_star = kernel.matrix(X_test, self.inducing_variable)
-        K_star_star = kernel.matrix(X_test, X_test)
+        K_star = self.kernel(X_test, self.inducing_variable)
+        K_star_star = self.kernel(X_test, X_test)
         mu_p = K_star @ K_uu_inv @ mu_u
 
         #predictive variance
@@ -526,9 +660,8 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
     #update mu_u, Sigma_u outside tf after fitting
     def predict_ins(self):
         #Kernels
-        kernel = tfp.math.psd_kernels.ExponentiatedQuadratic(self.variance, self.lengthscale)
-        K_uu = kernel.matrix(self.inducing_variable, self.inducing_variable)
-        K_uf = kernel.matrix(self.inducing_variable, self.X)
+        K_uu = self.kernel(self.inducing_variable, self.inducing_variable)
+        K_uf = self.kernel(self.inducing_variable, self.X)
         K_fu = tf.transpose(K_uf)
 
         # Constants
@@ -562,15 +695,14 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
         self.Sigma_u = Sigma_u
 
     def predict_out(self, Xnew):
-        kernel = tfp.math.psd_kernels.ExponentiatedQuadratic(self.variance, self.lengthscale)
-        K_uu = kernel.matrix(self.inducing_variable, self.inducing_variable)
-        K_xu = kernel.matrix(Xnew, self.inducing_variable)
+        K_uu = self.kernel(self.inducing_variable, self.inducing_variable)
+        K_xu = self.kernel(Xnew, self.inducing_variable)
         I_M = tf.eye(self.N_u, dtype=tf.float64)
 
         K_uu_inv = self.inv(K_uu)
 
         # compute variance
-        f_var = kernel.matrix(Xnew, Xnew) - K_xu @ K_uu_inv  @ tf.transpose(
+        f_var = self.kernel(Xnew, Xnew) - K_xu @ K_uu_inv  @ tf.transpose(
             K_xu) + K_xu @ K_uu_inv @ self.Sigma_u @ K_uu_inv @ tf.transpose(
             K_xu)
 
@@ -603,14 +735,35 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
         pass
 
 
-    """
+
     def sample_y(self, n_samples=100):
         N = self.X.shape[0]
         # compute the density of the sample based on q_u(\mu_u,\Sigma_u) and K
+        self.predict_ins()
+        #predict out
+        K_uu = self.kernel(self.inducing_variable, self.inducing_variable)
+        K_xu = self.kernel(self.X, self.inducing_variable)
+        I_M = tf.eye(self.N_u, dtype=tf.float64)
+        K_uu_inv = self.inv(K_uu)
 
-        # put the
+        # compute variance
+        f_var = self.kernel(self.X, self.X) - K_xu @ K_uu_inv  @ tf.transpose(
+            K_xu) + K_xu @ K_uu_inv @ self.Sigma_u @ K_uu_inv @ tf.transpose(
+            K_xu)
+
+        f_mean = K_xu @ K_uu_inv @ self.mu_u
+        
+        f = np.random.multivariate_normal(mean=tf.squeeze(f_mean), cov=f_var, size=n_samples)
+
         if self.loss_type == "MSE":
-            return f
+            err = self.Y - f_mean
+            #bootstrap on each column of err
+            N, D = err.shape
+            boot_err = np.zeros((n_samples, D))
+            for d in range(D):
+                boot_err[:, d] = np.random.choice(err[:, d], size=n_samples, replace=True)
+            return f + boot_err
+
         else:
             noise = tf.random.normal(
                 shape=(n_samples, N),
@@ -645,7 +798,7 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
         ##fit model with that lambda
         opt = gpflow.optimizers.Scipy()
         opt.minimize(self.train_step, self.trainable_variables)
-    """
+
 
 
 ####fisher divergence
