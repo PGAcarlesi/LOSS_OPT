@@ -132,11 +132,7 @@ class GVI_GP_alpha(gpflow.models.BayesianModel):
         # log-determinant / normalizer term (scalar)
         term_log = 0.5 * tf.reduce_sum(tf.math.log(var))
 
-        inv_sigma2 = tf.math.reciprocal(tf.square(tf.cast(self.sigma, tf.float64)))
-
-        term3 = 0.5 * inv_sigma2 * tf.reduce_sum(var + tf.square(tf.cast(self.sigma, tf.float64)))
-
-        return term_quad + term_log + term3
+        return term_quad + term_log
 
     # in sample GVI objective
     def GVI_step(self):
@@ -226,8 +222,8 @@ class GVI_GP_alpha(gpflow.models.BayesianModel):
 
         #predictive mean
         mu_p = K_star @ K_inv @ mu_f
-        A = K_star_star - K_star @ K_inv @ tf.transpose(K_star) \
-            + K_star @ K_inv @ Sigma_f @ tf.transpose(K_star @ K_inv)
+        A = K_star_star - K_star @ K_inv @ tf.transpose(K_star) +(
+                K_star @ K_inv @ Sigma_f @ tf.transpose(K_star @ K_inv))
 
         # use diagonal of covariance directly
         sigma_p = tf.linalg.diag_part(A)  # no inverse here
@@ -595,7 +591,6 @@ class GVI_SGPR_alpha(gpflow.models.BayesianModel):
     def pred_log_prob(self, y, mu_f, sigma_y):
         loss = 0.5 * tf.transpose(y - mu_f) / (sigma_y) @ (y - mu_f)
         loss += 0.5 * tf.reduce_sum(tf.math.log(sigma_y))
-        loss += 0.5 * self.sigma ** (-2) * tf.reduce_sum(sigma_y+self.sigma**2)
         return loss
 
     #compute predictive loss
